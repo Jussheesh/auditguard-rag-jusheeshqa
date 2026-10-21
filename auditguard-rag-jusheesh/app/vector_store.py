@@ -38,7 +38,7 @@ class LanceVectorStore:
     ) -> str:
         """
         Indexes all non-root AST nodes (sections, paragraphs, visuals, tables) into LanceDB.
-        Reuses precomputed chunk embeddings via node_vector_map to eliminate double CPU embedding!
+        Safe against schema mismatches and missing vector maps.
         """
         all_nodes = [
             n for n in ast.nodes.values()
@@ -50,7 +50,7 @@ class LanceVectorStore:
         table_name = self._get_table_name(ast.doc_id)
         node_vector_map = node_vector_map or {}
 
-        # Only compute embeddings for AST nodes (like section headers) not already in node_vector_map
+        # Fallback embedding generation if vectors aren't precomputed
         if embeddings_matrix is not None and len(embeddings_matrix) == len(all_nodes):
             actual_embeddings = [embeddings_matrix[i].tolist() for i in range(len(all_nodes))]
         else:
@@ -69,11 +69,13 @@ class LanceVectorStore:
             if missing_texts:
                 computed = embed_texts(missing_texts)
                 for m_idx, vec in zip(missing_indices, computed):
-                    actual_embeddings[m_idx] = vec.tolist()
+                    actual_embeddings[m_idx] = vec.tolist() if hasattr(vec, "tolist") else list(vec)
 
         records = []
         for idx, node in enumerate(all_nodes):
             vec = actual_embeddings[idx] if actual_embeddings[idx] is not None else [0.0] * 384
+            if not isinstance(vec, list):
+                vec = list(vec)
             records.append({
                 "id": str(node.id),
                 "vector": vec,
@@ -90,7 +92,14 @@ class LanceVectorStore:
                 "metadata": json.dumps(node.metadata),
             })
 
-        self.db.create_table(table_name, data=records, mode="overwrite")
+        try:
+            # Drop existing table if it exists to prevent schema conflict
+            if table_name in self.get_indexed_tables():
+                self.db.drop_table(table_name)
+        except Exception:
+            pass
+
+        self.db.create_table(table_name, data=records)
         return table_name
 
     def search(
