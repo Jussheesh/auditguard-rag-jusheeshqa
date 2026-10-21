@@ -7,4 +7,6 @@ pip install openai google-genai python-dotenv
 
 pip install python-multipart
 
+pip install fastembed onnxruntime
+
 python -m uvicorn app.main:app --reload
