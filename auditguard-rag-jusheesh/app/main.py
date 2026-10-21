@@ -1,0 +1,968 @@
+import asyncio
+import hashlib
+import json
+import os
+import re
+import time
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
+from starlette.concurrency import iterate_in_threadpool
+from pydantic import BaseModel
+
+from app.config import (
+    DOCS_DIR, INDEX_DIR, PREVIEWS_DIR, CROPS_DIR, TOP_K,
+    USE_GOOGLE_GENAI, GEMINI_API_KEY, get_gemma_model, set_gemma_model
+)
+from app.ingest import (
+    extract_pages_from_pdf, extract_pages_from_text,
+    extract_pages_from_docx, extract_pages_from_pptx,
+    extract_pages_from_excel, extract_pages_from_csv,
+    extract_pages_from_image,
+    render_page_previews, hierarchical_chunk, get_or_render_page_image
+)
+from app.ast_builder import build_document_ast, DocumentAST, ASTNode, ASTNodeType
+from app.vector_store import LanceVectorStore
+from app.discrepancy_scanner import scan_ast_for_discrepancies
+from app.embeddings import embed_texts, embed_query
+from app.retriever import HybridRetriever
+from app.evaluator import evaluate_relevance
+from app.generator import generate_grounded_answer, stream_grounded_answer
+from app.llm import call_plain_gemma
+from app.audit_scanner import run_compliance_audit
+
+app = FastAPI(title="AuditGuard RAG • Hierarchical Multimodal Tree-RAG", version="2.1.0")
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+if (STATIC_DIR / "assistant" / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assistant" / "assets")), name="assets")
+
+ACTIVE_RETRIEVER: HybridRetriever | None = None
+ACTIVE_CHUNKS: list = []
+ACTIVE_DOC_ID: str = ""
+DOCUMENT_VAULT: dict = {}
+DOCUMENT_ASTS: dict[str, DocumentAST] = {}
+LANCE_STORE = LanceVectorStore()
+
+ACTIVE_CLASSIFICATION: dict = {
+    "type": "NONE",
+    "label": "No Document Loaded",
+    "icon": "📁",
+    "confidence": 0.0,
+    "prompt_addon": ""
+}
+
+SESSION_REGISTRY: dict[str, dict] = {}
+
+GREETING_PATTERNS = {
+    "hi", "hello", "hey", "yo", "sup", "good morning", "good afternoon",
+    "good evening", "hola", "kumusta", "thanks", "thank you", "ok", "okay",
+    "ping", "who are you", "what can you do", "help"
+}
+
+def check_conversational_greeting(query: str) -> Optional[str]:
+    """Intercepts greetings ('hi', 'hello') in <1ms so they don't trigger a 6-step document audit."""
+    clean_q = re.sub(r"[^a-zA-Z0-9\s]", "", query.strip().lower()).strip()
+    if clean_q in GREETING_PATTERNS:
+        user_docs = [v["filename"] for k, v in DOCUMENT_VAULT.items() if k != "sample_enterprise_sop"]
+        if not user_docs and DOCUMENT_VAULT:
+            user_docs = [v["filename"] for v in DOCUMENT_VAULT.values()]
+        files_str = ", ".join(user_docs) if user_docs else "None loaded yet"
+        return (
+            f"👋 Hello! **AuditGuard RAG** is online and ready.\n\n"
+            f"- **Active Indexed Sources ({len(user_docs)}):** `{files_str}`\n"
+            f"- **Supported Formats:** PDF, Word (`.docx`), PowerPoint (`.pptx`), Excel (`.xlsx`), CSV, Images/Charts (`.png`/`.jpg`/`.webp`), JSON, Markdown, and Text.\n\n"
+            f"Ask me any question across your uploaded files—if multiple files cover the same topic, I will automatically synthesize and cite all of them!"
+        )
+    return None
+
+class QueryRequest(BaseModel):
+    query: str
+    include_baseline: bool = True
+    doc_id: Optional[str] = None
+    session_id: Optional[str] = None
+    model: Optional[str] = None
+
+class SessionSelectRequest(BaseModel):
+    session_id: str
+    doc_id: str
+
+@app.get("/health")
+def health_check():
+    lancedb_ready = False
+    try:
+        if LANCE_STORE and hasattr(LANCE_STORE, "db"):
+            if hasattr(LANCE_STORE.db, "list_tables"):
+                LANCE_STORE.db.list_tables()
+            else:
+                LANCE_STORE.db.table_names()
+            lancedb_ready = True
+    except Exception as e:
+        print(f"[LanceDB Health Ping Error]: {e}")
+        lancedb_ready = False
+
+    return {
+        "status": "healthy",
+        "service": "AuditGuard RAG Enterprise Grounding Engine",
+        "doc_loaded": len(ACTIVE_CHUNKS) > 0,
+        "classification": ACTIVE_CLASSIFICATION.get("label"),
+        "chunk_count": len(ACTIVE_CHUNKS),
+        "ast_loaded": ACTIVE_DOC_ID in DOCUMENT_ASTS,
+        "lancedb_ready": lancedb_ready,
+        "model": get_gemma_model(),
+        "engine": "Google GenAI (Native)" if USE_GOOGLE_GENAI else "OpenAI-Compatible (ALMA)",
+        "use_google_genai": USE_GOOGLE_GENAI,
+        "gemini_api_key_active": bool(GEMINI_API_KEY)
+    }
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """
+    Universal Multi-Format Local Ingestion:
+    Accepts PDF, DOCX, PPTX, XLSX, CSV, Images (.png/.jpg/.webp), JSON, MD, TXT, and code files.
+    Uses single-pass CPU embedding reuse to cut indexing time in half.
+    """
+    global ACTIVE_RETRIEVER, ACTIVE_CHUNKS, ACTIVE_CLASSIFICATION, ACTIVE_DOC_ID
+
+    t_start = time.perf_counter()
+    contents = await file.read()
+    filename = file.filename or "uploaded_doc.pdf"
+    content_hash = hashlib.sha256(contents).hexdigest()[:8]
+    safe_stem = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in Path(filename).stem)
+    doc_id = f"{safe_stem}_{content_hash}"
+
+    ext = Path(filename).suffix.lower()
+    is_pdf = (ext == ".pdf")
+    page_images = {}
+
+    if is_pdf:
+        pages = extract_pages_from_pdf(contents, filename)
+        page_images = render_page_previews(contents, doc_id)
+    elif ext in (".docx", ".doc"):
+        pages = extract_pages_from_docx(contents, filename)
+    elif ext in (".pptx", ".ppt"):
+        pages = extract_pages_from_pptx(contents, filename)
+    elif ext in (".xlsx", ".xlsm", ".xls"):
+        pages = extract_pages_from_excel(contents, filename)
+    elif ext == ".csv":
+        pages = extract_pages_from_csv(contents, filename)
+    elif ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
+        pages, page_images = extract_pages_from_image(contents, filename, doc_id)
+    elif ext in (".txt", ".md", ".json", ".log", ".py", ".js", ".html", ".xml", ".yaml", ".yml"):
+        text_str = contents.decode("utf-8", errors="replace")
+        pages = extract_pages_from_text(text_str, filename)
+    else:
+        try:
+            text_str = contents.decode("utf-8")
+        except UnicodeDecodeError:
+            text_str = contents.decode("latin-1", errors="replace")
+        pages = extract_pages_from_text(text_str, filename)
+
+    if not pages:
+        raise HTTPException(status_code=400, detail="Could not extract readable content from file.")
+
+    # 2. Compiler-Grade 3-Tier Document AST Construction
+    ast = build_document_ast(
+        doc_id=doc_id,
+        pages=pages,
+        pdf_bytes=contents if is_pdf else None,
+        doc_title=filename
+    )
+
+    # If standalone image was uploaded, register a VISUAL AST node so multimodal crops link cleanly
+    if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif") and 1 in page_images:
+        img_node = ASTNode(
+            id=f"{doc_id}_vis_img_1",
+            type=ASTNodeType.VISUAL,
+            title=f"Visual Asset: {filename}",
+            text=pages[0]["text"],
+            page=1,
+            materialized_path="root/visual_1",
+            image_url=page_images[1],
+            visual_type="figure",
+            confidence=0.99
+        )
+        ast.add_node(img_node, parent_id=ast.root_id)
+
+    DOCUMENT_ASTS[doc_id] = ast
+
+    # 3. Hierarchical Chunking + Automatic Document Type Classification
+    chunks, classification = hierarchical_chunk(pages, page_images)
+    ACTIVE_CLASSIFICATION = classification
+
+    para_nodes = [n for n in ast.nodes.values() if n.type == ASTNodeType.PARAGRAPH]
+    for c in chunks:
+        c["doc_id"] = doc_id
+        p_text = c.get("parent_text", "").strip()
+        matched = None
+        if p_text:
+            matched = next((n for n in para_nodes if n.page == c.get("page") and (p_text[:50] in n.text or n.text[:50] in p_text)), None)
+            if not matched:
+                matched = next((n for n in para_nodes if (p_text[:50] in n.text or n.text[:50] in p_text)), None)
+        if matched:
+            c["ast_node_id"] = matched.id
+            c["materialized_path"] = matched.materialized_path
+            c["linked_node_ids"] = list(matched.linked_node_ids)
+            if matched.linked_node_ids and not c.get("image_url"):
+                v_node = ast.get_node(matched.linked_node_ids[0])
+                if v_node and v_node.image_url:
+                    c["image_url"] = v_node.image_url
+                    c["has_visual"] = True
+        else:
+            c["ast_node_id"] = None
+            c["materialized_path"] = "unresolved"
+            c["linked_node_ids"] = []
+            if not c.get("has_visual"):
+                c["has_visual"] = False
+
+    # 4. Single-Pass Dense Vector Embeddings (Child Sentences)
+    child_texts = [c["child_text"] for c in chunks]
+    embeddings_matrix = await asyncio.to_thread(embed_texts, child_texts)
+
+    # Map AST paragraph node IDs to their already-computed vectors to avoid re-embedding in LanceDB!
+    node_vector_map: Dict[str, List[float]] = {}
+    for idx, c in enumerate(chunks):
+        nid = c.get("ast_node_id")
+        if nid and nid not in node_vector_map and idx < len(embeddings_matrix):
+            node_vector_map[nid] = embeddings_matrix[idx].tolist()
+
+    # 5. Index AST Leaves into LanceDB reusing precomputed paragraph vectors
+    try:
+        await asyncio.to_thread(LANCE_STORE.index_ast, ast, None, node_vector_map)
+    except Exception as e:
+        print(f"LanceDB indexing warning: {e}")
+
+    # 6. Initialize Hybrid RRF Retriever
+    ACTIVE_CHUNKS = chunks
+    ACTIVE_RETRIEVER = HybridRetriever(chunks, embeddings_matrix, lance_store=LANCE_STORE, doc_id=doc_id)
+    ACTIVE_DOC_ID = doc_id
+
+    indexing_ms = round((time.perf_counter() - t_start) * 1000, 2)
+
+    DOCUMENT_VAULT[doc_id] = {
+        "doc_id": doc_id,
+        "filename": filename,
+        "pages": len(pages),
+        "total_chunks": len(chunks),
+        "total_ast_nodes": len(ast.nodes),
+        "cross_modal_links": len(ast.get_cross_modal_links()),
+        "indexing_duration_ms": indexing_ms,
+        "classification": classification,
+        "retriever": ACTIVE_RETRIEVER,
+        "ast": ast,
+        "chunks": chunks,
+        "uploaded_at": datetime.now().strftime("%H:%M:%S")
+    }
+
+    return {
+        "ok": True,
+        "filename": filename,
+        "pages_processed": len(pages),
+        "total_chunks": len(chunks),
+        "total_ast_nodes": len(ast.nodes),
+        "cross_modal_links": len(ast.get_cross_modal_links()),
+        "indexing_duration_ms": indexing_ms,
+        "classification": ACTIVE_CLASSIFICATION,
+        "doc_id": doc_id
+    }
+
+class ExportReportRequest(BaseModel):
+    query: str
+    answer: str
+    sources: list = []
+    classification: dict = {}
+    evaluation: dict = {}
+    baseline: str = ""
+    format: str = "markdown"
+
+@app.post("/export-report")
+async def export_audit_report(payload: ExportReportRequest):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    date_slug = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if payload.format == "json":
+        data = {
+            "title": "AuditGuard Grounded Audit Trail Report",
+            "exported_at": timestamp,
+            "query": payload.query,
+            "grounded_answer": payload.answer,
+            "grounding_evaluation": payload.evaluation,
+            "classification": payload.classification,
+            "verified_sources": payload.sources,
+            "ungrounded_baseline": payload.baseline
+        }
+        json_bytes = json.dumps(data, indent=2).encode("utf-8")
+        filename = f"audit_trail_{date_slug}.json"
+        return Response(
+            content=json_bytes,
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+
+    lines = [
+        "# 🛡️ AuditGuard Formal Document Intelligence Report",
+        f"**Generated:** {timestamp}",
+        f"**Classification:** {payload.classification.get('label', 'Enterprise Document')}",
+        f"**Grounding Status:** {payload.evaluation.get('badge', 'GROUNDED')}",
+        f"**Grounding Score:** {payload.evaluation.get('confidence', 0)}%",
+        "",
+        "---",
+        "",
+        "## 1. Audit Query",
+        f"> {payload.query}",
+        "",
+        "## 2. Grounded Synthesis & Verdict",
+        payload.answer,
+        "",
+        "---",
+        "",
+        "## 3. Verified Evidentiary Sources"
+    ]
+
+    if not payload.sources:
+        lines.append("*No evidentiary sources retrieved.*")
+    else:
+        for idx, src in enumerate(payload.sources, 1):
+            cid = src.get("citation_id", idx)
+            doc = src.get("filename", "Active Document")
+            page = src.get("page", 1)
+            dense = src.get("dense_score", 0.0)
+            text = src.get("parent_text", src.get("child_text", "")).strip()
+            lines.append(f"### [{cid}] {doc} (Page {page}) — Dense Match: {dense}")
+            lines.append(f"```\n{text}\n```\n")
+
+    if payload.baseline:
+        lines.extend([
+            "---",
+            "",
+            "## 4. Hallucination Radar (Baseline Comparison)",
+            "**Ungrounded LLM Output (Zero-Context Baseline):**",
+            f"> {payload.baseline}"
+        ])
+
+    md_content = "\n".join(lines).encode("utf-8")
+    filename = f"audit_report_{date_slug}.md"
+    return Response(
+        content=md_content,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+def get_doc_context(doc_id: Optional[str] = None, session_id: Optional[str] = None):
+    if doc_id:
+        if doc_id not in DOCUMENT_VAULT:
+            raise HTTPException(status_code=404, detail=f"Document '{doc_id}' not found in vault.")
+        target_doc_id = doc_id
+    elif session_id and session_id in SESSION_REGISTRY:
+        bound_id = SESSION_REGISTRY[session_id].get("active_doc_id")
+        if bound_id and bound_id not in DOCUMENT_VAULT:
+            raise HTTPException(status_code=404, detail=f"Bound document '{bound_id}' not found in vault.")
+        target_doc_id = bound_id or ACTIVE_DOC_ID
+    else:
+        target_doc_id = ACTIVE_DOC_ID
+
+    vault_entry = DOCUMENT_VAULT.get(target_doc_id)
+    retriever = vault_entry["retriever"] if vault_entry else ACTIVE_RETRIEVER
+    classification = vault_entry["classification"] if vault_entry else ACTIVE_CLASSIFICATION
+    ast = DOCUMENT_ASTS.get(target_doc_id)
+    return target_doc_id, vault_entry, retriever, classification, ast
+
+def hydrate_chunk_visuals(chunk: Dict[str, Any], ast: Optional[DocumentAST]):
+    if not ast:
+        return
+    ast_id = chunk.get("ast_node_id")
+    if ast_id:
+        node = ast.get_node(ast_id)
+        if node and node.linked_node_ids:
+            linked_visuals = []
+            for lid in node.linked_node_ids:
+                v_node = ast.get_node(lid)
+                if v_node and v_node.image_url:
+                    linked_visuals.append({
+                        "id": v_node.id,
+                        "title": v_node.title,
+                        "image_url": v_node.image_url,
+                        "visual_type": v_node.visual_type,
+                        "page": v_node.page
+                    })
+            if linked_visuals:
+                chunk["linked_visuals"] = linked_visuals
+                if not chunk.get("image_url"):
+                    chunk["image_url"] = linked_visuals[0]["image_url"]
+                    chunk["has_visual"] = True
+
+def execute_rag_retrieval_and_eval(
+    retriever: HybridRetriever,
+    query: str,
+    ast: Optional[DocumentAST] = None,
+    top_k: int = TOP_K,
+    search_all_vault: bool = False
+) -> tuple[list, dict, float]:
+    """
+    Unified RAG Retrieval & Evaluation Service:
+    When search_all_vault=True and multiple user documents exist in DOCUMENT_VAULT,
+    queries across ALL uploaded user documents, stratifies (Round-Robin) matching chunks
+    across files so no file is ignored, and re-numbers citations [1], [2], ... cleanly!
+    """
+    t0 = time.perf_counter()
+
+    # Determine if we should search across multiple uploaded user documents
+    user_vault_entries = [
+        v for k, v in DOCUMENT_VAULT.items()
+        if k != "sample_enterprise_sop" and v.get("retriever") is not None
+    ]
+
+    if search_all_vault and len(user_vault_entries) > 1:
+        q_vec = embed_query(query)
+        by_file: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+        for entry in user_vault_entries:
+            doc_ret: HybridRetriever = entry["retriever"]
+            doc_ast: Optional[DocumentAST] = entry.get("ast")
+            hits = doc_ret.retrieve(query, top_k=top_k, q_vec=q_vec)
+            for h in hits:
+                hydrate_chunk_visuals(h, doc_ast)
+                # Keep chunks that have meaningful lexical or semantic signal
+                if h.get("dense_score", 0.0) >= 0.30 or h.get("bm25_score", 0.0) > 0:
+                    by_file[entry["filename"]].append(h)
+
+        # Sort files by their strongest matching chunk score
+        sorted_filenames = sorted(
+            by_file.keys(),
+            key=lambda fn: max((c.get("dense_score", 0.0) for c in by_file[fn]), default=0.0),
+            reverse=True
+        )
+
+        # Round-Robin interleave across all matching files so EVERY relevant file is cited!
+        retrieved = []
+        max_total = max(top_k, len(sorted_filenames) * 2)
+        depth = 0
+        while len(retrieved) < max_total:
+            added = False
+            for fn in sorted_filenames:
+                if depth < len(by_file[fn]):
+                    retrieved.append(by_file[fn][depth])
+                    added = True
+                    if len(retrieved) >= max_total:
+                        break
+            if not added:
+                break
+            depth += 1
+
+        # Re-number citation_id sequentially [1], [2], [3]... across the combined multi-file pool
+        for idx, c in enumerate(retrieved, 1):
+            c["citation_id"] = idx
+    else:
+        retrieved = retriever.retrieve(query, top_k=top_k)
+        if ast:
+            for chunk in retrieved:
+                hydrate_chunk_visuals(chunk, ast)
+
+    retrieval_ms = round((time.perf_counter() - t0) * 1000, 2)
+    eval_result = evaluate_relevance(retrieved, query=query)
+
+    # Tier 2 AST Whole-Page Escalation
+    if eval_result["status"] == "REFUSE" and retriever:
+        candidate_pages = [c.get("page") for c in retrieved if c.get("page")]
+        escalated_chunks = retriever.escalate_page_scan(query, candidate_pages, ast=ast)
+        if escalated_chunks:
+            escalated_eval = evaluate_relevance(escalated_chunks, query=query)
+            if escalated_eval["status"] != "REFUSE":
+                retrieved = escalated_chunks
+                eval_result = escalated_eval
+
+    return retrieved, eval_result, retrieval_ms
+
+@app.post("/ask")
+@app.post("/query")
+async def ask_question(payload: QueryRequest):
+    global ACTIVE_RETRIEVER, ACTIVE_CLASSIFICATION, ACTIVE_DOC_ID
+
+    target_doc_id, vault_entry, retriever, classification, ast = get_doc_context(
+        payload.doc_id, payload.session_id
+    )
+
+    if not retriever:
+        raise HTTPException(status_code=400, detail="No document loaded. Please upload a document first.")
+
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+
+    t_total_start = time.perf_counter()
+
+    # 0. Fast 1ms Conversational Greeting Router (Prevents "hi" from auditing the PDF!)
+    greeting_reply = check_conversational_greeting(query)
+    if greeting_reply:
+        return {
+            "query": query,
+            "status": "CONVERSATIONAL",
+            "evaluation": {
+                "status": "CONVERSATIONAL",
+                "confidence": 100.0,
+                "grounding_score": 1.0,
+                "dense_score": 1.0,
+                "lexical_recall": 1.0,
+                "nli_verdict": "CONVERSATIONAL",
+                "nli_entailment_prob": 1.0,
+                "badge": "💬 ASSISTANT READY",
+                "reason": "Direct conversational greeting routed in <1ms without querying vector index."
+            },
+            "answer": greeting_reply,
+            "sources": [],
+            "baseline": "",
+            "classification": classification,
+            "retrieval_ms": 0.5,
+            "total_ms": round((time.perf_counter() - t_total_start) * 1000, 2),
+            "estimated_tokens": 0,
+            "tokens": 0,
+            "is_fallback": False,
+            "model": payload.model or get_gemma_model(),
+            "doc_id": target_doc_id
+        }
+
+    # Enable cross-vault multi-file retrieval unless a specific doc_id was explicitly locked
+    has_explicit_lock = bool(payload.doc_id) or (
+        bool(payload.session_id) and payload.session_id in SESSION_REGISTRY
+    )
+
+    # 1. Unified Retrieval & Grounding Evaluation (Multi-Document Aware!)
+    retrieved, eval_result, retrieval_ms = execute_rag_retrieval_and_eval(
+        retriever, query, ast=ast, top_k=TOP_K, search_all_vault=(not has_explicit_lock)
+    )
+
+    # 2. Token Usage Estimation
+    context_words = sum(len(c.get("parent_text", "").split()) for c in retrieved)
+    query_words = len(query.split())
+    estimated_tokens = int((context_words + query_words) * 1.33 + 200)
+
+    # 3. Check for Defense Refusal
+    if eval_result["status"] == "REFUSE":
+        plain_baseline = await asyncio.to_thread(call_plain_gemma, query) if payload.include_baseline else ""
+        return {
+            "query": query,
+            "status": "REFUSE",
+            "evaluation": eval_result,
+            "answer": eval_result["reason"],
+            "sources": [],
+            "baseline": plain_baseline,
+            "classification": classification,
+            "retrieval_ms": retrieval_ms,
+            "total_ms": round((time.perf_counter() - t_total_start) * 1000, 2),
+            "estimated_tokens": 0,
+            "tokens": 0,
+            "is_fallback": False,
+            "model": payload.model or get_gemma_model(),
+            "doc_id": target_doc_id
+        }
+
+    # 4 & 5. Synthesize Grounded Answer & Hallucination Baseline in PARALLEL
+    persona = classification.get("prompt_addon", "")
+    model_choice = payload.model or get_gemma_model()
+
+    async def _fetch_grounded():
+        return await asyncio.to_thread(generate_grounded_answer, query, retrieved, persona, model_choice)
+
+    async def _fetch_baseline():
+        if payload.include_baseline:
+            return await asyncio.to_thread(call_plain_gemma, query)
+        return ""
+
+    grounded_res, plain_baseline = await asyncio.gather(_fetch_grounded(), _fetch_baseline())
+
+    citation_verification = {}
+    has_multimodal = False
+    if isinstance(grounded_res, dict):
+        grounded_answer = grounded_res.get("answer", "")
+        actual_tokens = grounded_res.get("tokens", 0)
+        is_fallback = grounded_res.get("is_fallback", False)
+        model_used = grounded_res.get("model", model_choice)
+        citation_verification = grounded_res.get("citation_verification", {})
+        has_multimodal = grounded_res.get("has_multimodal_context", False)
+    else:
+        grounded_answer = str(grounded_res)
+        actual_tokens = 0
+        is_fallback = False
+        model_used = model_choice
+
+    reported_tokens = actual_tokens if actual_tokens > 0 else (0 if is_fallback else estimated_tokens)
+    status = "SUCCESS"
+    citation_verdict = citation_verification.get("verdict", "VERIFIED")
+    
+    if "I cannot verify this information" in grounded_answer:
+        status = "REFUSE"
+        eval_result["status"] = "REFUSE"
+        eval_result["badge"] = "⚠️ OUT-OF-BOUNDS (Refused)"
+    elif not citation_verification.get("all_supported", True) or citation_verdict in ("NO_CITATIONS", "INVALID_CITATION", "UNSUPPORTED_CLAIM"):
+        status = "CAUTION_UNSUPPORTED_CITATION"
+        eval_result["badge"] = f"⚠️ CAUTION: {citation_verdict} Grounding Warning"
+
+    return {
+        "query": query,
+        "status": status,
+        "evaluation": eval_result,
+        "answer": grounded_answer,
+        "sources": retrieved,
+        "baseline": plain_baseline,
+        "classification": classification,
+        "retrieval_ms": retrieval_ms,
+        "total_ms": round((time.perf_counter() - t_total_start) * 1000, 2),
+        "estimated_tokens": reported_tokens,
+        "tokens": reported_tokens,
+        "is_fallback": is_fallback,
+        "model": model_used,
+        "doc_id": target_doc_id,
+        "citation_verification": citation_verification,
+        "has_multimodal_context": has_multimodal
+    }
+
+@app.post("/session/select")
+def select_session_document(payload: SessionSelectRequest):
+    if payload.doc_id not in DOCUMENT_VAULT:
+        raise HTTPException(status_code=404, detail="Document not found in vault.")
+    SESSION_REGISTRY[payload.session_id] = {
+        "active_doc_id": payload.doc_id,
+        "selected_at": datetime.now().strftime("%H:%M:%S")
+    }
+    doc = DOCUMENT_VAULT[payload.doc_id]
+    return {
+        "ok": True,
+        "session_id": payload.session_id,
+        "active_doc_id": payload.doc_id,
+        "filename": doc["filename"]
+    }
+
+@app.get("/session/{session_id}")
+def get_session_status(session_id: str):
+    session_data = SESSION_REGISTRY.get(session_id)
+    if not session_data:
+        return {"session_id": session_id, "active_doc_id": ACTIVE_DOC_ID, "bound": False}
+    return {"session_id": session_id, "active_doc_id": session_data.get("active_doc_id"), "bound": True}
+
+@app.get("/ask-stream")
+async def ask_stream(
+    query: str,
+    doc_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    model: Optional[str] = None
+):
+    target_doc_id, vault_entry, retriever, classification, ast = get_doc_context(doc_id, session_id)
+
+    if not retriever:
+        return StreamingResponse(iter(["Error: No document loaded."]), media_type="text/plain")
+
+    clean_query = query.strip()
+    if not clean_query:
+        return StreamingResponse(iter(["Error: Query cannot be empty."]), media_type="text/plain")
+
+    # Fast 1ms Greeting Check for Streaming Route
+    greeting_reply = check_conversational_greeting(clean_query)
+    if greeting_reply:
+        return StreamingResponse(iter([greeting_reply]), media_type="text/plain")
+
+    has_explicit_lock = bool(doc_id) or (bool(session_id) and session_id in SESSION_REGISTRY)
+    retrieved, eval_result, _ = execute_rag_retrieval_and_eval(
+        retriever, clean_query, ast=ast, top_k=TOP_K, search_all_vault=(not has_explicit_lock)
+    )
+
+    if eval_result["status"] == "REFUSE":
+        async def refuse_generator():
+            yield f"⚠️ UNVERIFIABLE: {eval_result['reason']}"
+        return StreamingResponse(refuse_generator(), media_type="text/plain")
+
+    persona = classification.get("prompt_addon", "")
+    model_choice = model or get_gemma_model()
+    return StreamingResponse(
+        iterate_in_threadpool(stream_grounded_answer(clean_query, retrieved, persona, model_choice)),
+        media_type="text/plain"
+    )
+
+@app.get("/api/ast")
+def get_active_document_ast(
+    doc_id: Optional[str] = None,
+    session_id: Optional[str] = None
+):
+    target_doc_id, _, _, _, ast = get_doc_context(doc_id, session_id)
+    if not target_doc_id or not ast:
+        raise HTTPException(status_code=404, detail="No active Document AST available.")
+    return ast.to_dict()
+
+@app.get("/api/discrepancies")
+@app.get("/api/ast/discrepancies")
+def get_active_discrepancies(
+    doc_id: Optional[str] = None,
+    session_id: Optional[str] = None
+):
+    target_doc_id, vault_entry, _, _, ast = get_doc_context(doc_id, session_id)
+    if not target_doc_id or not ast:
+        raise HTTPException(status_code=400, detail="No document loaded. Please upload or load a document first.")
+    
+    use_llm_verification = USE_GOOGLE_GENAI and bool(GEMINI_API_KEY)
+    report = scan_ast_for_discrepancies(ast, use_llm=use_llm_verification)
+    report["filename"] = vault_entry.get("filename", "Current Document") if vault_entry else "Current Document"
+    report["doc_id"] = target_doc_id
+    return report
+
+@app.get("/api/ast/{doc_id}")
+def get_document_ast_by_id(doc_id: str):
+    if doc_id not in DOCUMENT_ASTS:
+        raise HTTPException(status_code=404, detail=f"Document AST for '{doc_id}' not found.")
+    return DOCUMENT_ASTS[doc_id].to_dict()
+
+@app.get("/api/preview/{doc_prefix}/{page_num}")
+async def get_preview_image(doc_prefix: str, page_num: int):
+    img_path = get_or_render_page_image(doc_prefix, page_num)
+    if img_path and img_path.exists():
+        media_type = "image/webp" if img_path.suffix.lower() == ".webp" else "image/png"
+        return FileResponse(str(img_path), media_type=media_type)
+    raise HTTPException(status_code=404, detail="Page preview could not be generated.")
+
+@app.post("/load-sample")
+async def load_sample_document():
+    global ACTIVE_RETRIEVER, ACTIVE_CHUNKS, ACTIVE_CLASSIFICATION, ACTIVE_DOC_ID
+    sample_path = DOCS_DIR / "sample_enterprise_sop.txt"
+    
+    sample_content = """# GLOBAL VIRTUAL ASSISTANT SERVICE LEVEL AGREEMENT & ESCALATION SOP
+
+1. PURPOSE & SCOPE OF ENGAGEMENT
+This Agreement governs all remote virtual assistant, administrative, and data verification operations provided by ALMA Talent Solutions. All remote personnel must maintain compliance with enterprise data security protocols (ISO 27001).
+
+2. SYSTEM UPTIME & RESPONSE TIME SLA
+2.1 Uptime Guarantee: The service provider guarantees 99.9% availability during standard client business hours (08:00 to 18:00 EST).
+2.2 Penalty Credit: In the event that service availability drops below 99.5% in any calendar billing month, the client shall be entitled to an immediate 15% billing credit applied to the next invoice cycle.
+Table 1: Q3 Historical Availability & Outage Log:
+| Month | Target SLA | Actual Uptime | Outage Minutes | Penalty Credit Due |
+| July | 99.9% | 99.95% | 12 min | 0% |
+| August | 99.9% | 99.80% | 45 min | 0% |
+| September | 99.9% | 98.20% | 420 min | 15% Penalty Due (Breach) |
+
+3. DATA PROTECTION & ZERO-TRUST SECURITY
+3.1 Access Control: Remote virtual assistants shall never store client credentials on personal local drives. All authentication must occur through hardware-enforced MFA or enterprise SSO.
+3.2 Incident Escalation Flowchart (Figure 1):
+- Step 1: Any unauthorized data access alert must be logged within 15 minutes of occurrence.
+- Step 2: Immediate written notice must be submitted to the Client Security Officer within 1 hour.
+- Step 3: All active VPN sessions for the affected contractor account must be terminated immediately.
+
+4. WIRE TRANSFERS & FINANCIAL AUTHORIZATION
+4.1 Dual Authorization: Wire transfers or account disbursements exceeding $50,000 require written sign-off from both the Chief Financial Officer (CFO) and the Managing Director.
+4.2 Audit Retention: All wire transfer authorization records must be archived in encrypted cold storage for a minimum period of 7 years.
+
+5. TERMINATION FOR CONVENIENCE
+Either party may terminate this agreement without cause by providing at least 30 business days prior written notice. Early termination fees are explicitly waived after the initial 6-month contract anniversary."""
+    
+    sample_path.write_text(sample_content, encoding="utf-8")
+    sample_doc_id = "sample_enterprise_sop"
+
+    t0 = time.perf_counter()
+    pages = extract_pages_from_text(sample_content, "sample_enterprise_sop.txt")
+    chunks, classification = hierarchical_chunk(pages)
+    
+    ast = build_document_ast(sample_doc_id, pages, doc_title="Enterprise SLA & SOP")
+    
+    table_node = ASTNode(
+        id=f"{sample_doc_id}_vis_table_1",
+        type=ASTNodeType.VISUAL,
+        title="Table 1: Q3 Historical Availability & Outage Log",
+        text="Historical Uptime Log: September availability declined to 98.20% (Breach). Penalty credit of 15% triggered.",
+        page=1,
+        materialized_path="root/sec_2/table_1",
+        image_url="/static/previews/sample_enterprise_sop_page_1.webp",
+        visual_type="table",
+        confidence=0.98
+    )
+    ast.add_node(table_node, parent_id=f"{sample_doc_id}_sec_2")
+
+    p2 = [n for n in ast.nodes.values() if "99.9%" in n.text and n.type == ASTNodeType.PARAGRAPH]
+    if p2:
+        p2[0].linked_node_ids.append(table_node.id)
+        table_node.linked_node_ids.append(p2[0].id)
+        p2[0].metadata["link_tier"] = 1
+        p2[0].metadata["link_weight"] = 1.0
+
+    para_nodes = [n for n in ast.nodes.values() if n.type == ASTNodeType.PARAGRAPH]
+    for c in chunks:
+        c["doc_id"] = sample_doc_id
+        p_text = c.get("parent_text", "").strip()
+        matched = next((n for n in para_nodes if (p_text[:50] in n.text or n.text[:50] in p_text)), None)
+        if matched:
+            c["ast_node_id"] = matched.id
+            c["materialized_path"] = matched.materialized_path
+            c["linked_node_ids"] = list(matched.linked_node_ids)
+            if matched.linked_node_ids and not c.get("image_url"):
+                v_node = ast.get_node(matched.linked_node_ids[0])
+                if v_node and v_node.image_url:
+                    c["image_url"] = v_node.image_url
+                    c["has_visual"] = True
+        else:
+            c["ast_node_id"] = None
+            c["materialized_path"] = "unresolved"
+            c["linked_node_ids"] = []
+            if not c.get("has_visual"):
+                c["has_visual"] = False
+
+    DOCUMENT_ASTS[sample_doc_id] = ast
+    ACTIVE_CLASSIFICATION = classification
+    ACTIVE_CHUNKS = chunks
+
+    child_texts = [c["child_text"] for c in chunks]
+    embeddings_matrix = await asyncio.to_thread(embed_texts, child_texts)
+    ACTIVE_RETRIEVER = HybridRetriever(chunks, embeddings_matrix, lance_store=LANCE_STORE, doc_id=sample_doc_id)
+    ACTIVE_DOC_ID = sample_doc_id
+
+    node_vector_map: Dict[str, List[float]] = {}
+    for idx, c in enumerate(chunks):
+        nid = c.get("ast_node_id")
+        if nid and nid not in node_vector_map and idx < len(embeddings_matrix):
+            node_vector_map[nid] = embeddings_matrix[idx].tolist()
+
+    try:
+        await asyncio.to_thread(LANCE_STORE.index_ast, ast, None, node_vector_map)
+    except Exception as e:
+        print(f"LanceDB index error: {e}")
+
+    indexing_ms = round((time.perf_counter() - t0) * 1000, 2)
+
+    DOCUMENT_VAULT[sample_doc_id] = {
+        "doc_id": sample_doc_id,
+        "filename": "sample_enterprise_sop.txt",
+        "pages": len(pages),
+        "total_chunks": len(chunks),
+        "total_ast_nodes": len(ast.nodes),
+        "cross_modal_links": len(ast.get_cross_modal_links()),
+        "indexing_duration_ms": indexing_ms,
+        "classification": classification,
+        "retriever": ACTIVE_RETRIEVER,
+        "ast": ast,
+        "chunks": chunks,
+        "uploaded_at": datetime.now().strftime("%H:%M:%S")
+    }
+
+    return {
+        "ok": True,
+        "filename": "sample_enterprise_sop.txt",
+        "doc_id": sample_doc_id,
+        "pages_processed": len(pages),
+        "total_chunks": len(chunks),
+        "total_ast_nodes": len(ast.nodes),
+        "cross_modal_links": len(ast.get_cross_modal_links()),
+        "indexing_duration_ms": indexing_ms,
+        "classification": ACTIVE_CLASSIFICATION
+    }
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        await load_sample_document()
+        print("[AuditGuard RAG] Default Enterprise SLA loaded successfully.")
+    except Exception as e:
+        print(f"[AuditGuard RAG Startup Error]: {e}")
+
+    try:
+        tables = LANCE_STORE.get_indexed_tables()
+        for tbl in tables:
+            if tbl.startswith("ast_"):
+                d_id = tbl[len("ast_"):]
+                if d_id not in DOCUMENT_VAULT:
+                    reconstructed = LANCE_STORE.reconstruct_document_data(d_id)
+                    if reconstructed:
+                        r_ast, r_chunks, r_emb = reconstructed
+                        r_retriever = HybridRetriever(r_chunks, r_emb, lance_store=LANCE_STORE, doc_id=d_id)
+                        DOCUMENT_ASTS[d_id] = r_ast
+                        DOCUMENT_VAULT[d_id] = {
+                            "doc_id": d_id,
+                            "filename": f"{d_id}.pdf",
+                            "pages": len(r_ast.get_all_pages()) if hasattr(r_ast, "get_all_pages") else 1,
+                            "total_chunks": len(r_chunks),
+                            "total_ast_nodes": len(r_ast.nodes),
+                            "cross_modal_links": len(r_ast.get_cross_modal_links()),
+                            "indexing_duration_ms": 0.0,
+                            "classification": {"type": "PERSISTED", "label": "Persisted Document", "icon": "💾", "confidence": 1.0, "prompt_addon": ""},
+                            "retriever": r_retriever,
+                            "ast": r_ast,
+                            "chunks": r_chunks,
+                            "uploaded_at": "Rehydrated from LanceDB"
+                        }
+                        print(f"[AuditGuard RAG] Successfully rehydrated '{d_id}' from LanceDB table '{tbl}'.")
+    except Exception as rehydrate_err:
+        print(f"[AuditGuard LanceDB Rehydration Warning]: {rehydrate_err}")
+
+@app.get("/vault")
+def get_vault():
+    items = []
+    for k, v in DOCUMENT_VAULT.items():
+        items.append({
+            "doc_id": v["doc_id"],
+            "filename": v["filename"],
+            "pages": v["pages"],
+            "total_chunks": v["total_chunks"],
+            "total_ast_nodes": v.get("total_ast_nodes", 0),
+            "cross_modal_links": v.get("cross_modal_links", 0),
+            "indexing_duration_ms": v.get("indexing_duration_ms", 0),
+            "classification": v["classification"],
+            "uploaded_at": v["uploaded_at"],
+            "is_active": (v["doc_id"] == ACTIVE_DOC_ID)
+        })
+    return {"vault": items, "active_doc_id": ACTIVE_DOC_ID}
+
+@app.post("/vault/select/{doc_id}")
+def select_vault_document(doc_id: str):
+    global ACTIVE_RETRIEVER, ACTIVE_CHUNKS, ACTIVE_CLASSIFICATION, ACTIVE_DOC_ID
+    if doc_id not in DOCUMENT_VAULT:
+        raise HTTPException(status_code=404, detail="Document not found in vault.")
+    
+    doc = DOCUMENT_VAULT[doc_id]
+    ACTIVE_RETRIEVER = doc["retriever"]
+    ACTIVE_CHUNKS = doc["chunks"]
+    ACTIVE_CLASSIFICATION = doc["classification"]
+    ACTIVE_DOC_ID = doc_id
+    return {
+        "ok": True,
+        "active_doc_id": doc_id,
+        "filename": doc["filename"],
+        "classification": ACTIVE_CLASSIFICATION
+    }
+
+@app.get("/compliance-audit")
+def get_compliance_audit(
+    doc_id: Optional[str] = None,
+    session_id: Optional[str] = None
+):
+    target_doc_id, vault_entry, retriever, classification, _ = get_doc_context(doc_id, session_id)
+    if not retriever:
+        raise HTTPException(status_code=400, detail="No document loaded. Please upload or load a document first.")
+    
+    report = run_compliance_audit(retriever)
+    report["doc_id"] = target_doc_id
+    report["filename"] = vault_entry.get("filename", "Current Document") if vault_entry else "Current Document"
+    report["classification"] = classification
+    return report
+
+@app.post("/api/model/toggle")
+def toggle_model():
+    current = get_gemma_model()
+    new_model = "gemma-4-31b-it" if current == "gemma-4-26b-a4b-it" else "gemma-4-26b-a4b-it"
+    set_gemma_model(new_model)
+    return {
+        "ok": True,
+        "model": new_model,
+        "label": "Gemma 4 MoE (~3s)" if new_model == "gemma-4-26b-a4b-it" else "Gemma 4 Dense 31B (~28s)"
+    }
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_ui():
+    html_path = STATIC_DIR / "index.html"
+    if html_path.exists():
+        return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<h1>AuditGuard UI Loading...</h1>")
+
+@app.get("/assistant", response_class=HTMLResponse)
+async def serve_assistant_ui():
+    html_path = STATIC_DIR / "assistant" / "index.html"
+    if html_path.exists():
+        return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<h1>Assistant UI not found.</h1>", status_code=404)
